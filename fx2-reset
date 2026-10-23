@@ -17,14 +17,16 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-VENV_BIN = os.path.join(HERE, ".venv", "Scripts" if os.name == "nt" else "bin")
+VENV = os.path.join(HERE, ".venv")
+VENV_BIN = os.path.join(VENV, "Scripts" if os.name == "nt" else "bin")
 
 try:
     import usb1
 except ImportError:
     # Re-run with the project's venv, where fx2 (and its libusb1 dependency) lives.
+    # Compare environments, not binaries: a venv's python is a symlink to its base one.
     venv_python = os.path.join(VENV_BIN, "python.exe" if os.name == "nt" else "python")
-    if os.path.exists(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
+    if os.path.exists(venv_python) and os.path.realpath(sys.prefix) != os.path.realpath(VENV):
         os.execv(venv_python, [venv_python, os.path.realpath(__file__)] + sys.argv[1:])
     sys.exit("error: python package 'libusb1' not found; see Requirements in readme.md")
 
