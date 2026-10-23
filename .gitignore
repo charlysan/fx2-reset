@@ -1,0 +1,8 @@
+*
+
+!.gitignore
+!Makefile
+!reenum.c
+!fx2-reset
+!readme.md
+!requirements.txt

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+fx2-reset: give an FX2 logic analyzer clone (FX2 + C0 EEPROM) back to the
+vendor app after sigrok has loaded fx2lafw into its RAM, without replugging.
+
+States, as seen through libusb:
+  0925:3881, no string descriptors   -> bare EEPROM boot; vendor app works
+  0925:3881, "sigrok" / "fx2lafw"    -> fx2lafw resident (same-VID/PID build)
+  0925:3881, other strings           -> other firmware (e.g. the vendor app's)
+  1d50:608c                          -> generic fx2lafw resident
+  04b4:8613                          -> FX2 core defaults (EEPROM ID not used)
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+VENV_BIN = os.path.join(HERE, ".venv", "Scripts" if os.name == "nt" else "bin")
+
+try:
+    import usb1
+except ImportError:
+    # Re-run with the project's venv, where fx2 (and its libusb1 dependency) lives.
+    venv_python = os.path.join(VENV_BIN, "python.exe" if os.name == "nt" else "python")
+    if os.path.exists(venv_python) and os.path.realpath(sys.executable) != os.path.realpath(venv_python):
+        os.execv(venv_python, [venv_python, os.path.realpath(__file__)] + sys.argv[1:])
+    sys.exit("error: python package 'libusb1' not found; see Requirements in readme.md")
+
+FIRMWARE = os.path.join(HERE, "reenum.hex")
+FX2TOOL = os.environ.get(
+    "FX2TOOL", os.path.join(VENV_BIN, "fx2tool.exe" if os.name == "nt" else "fx2tool"))
+
+EEPROM_ID = (0x0925, 0x3881)
+FX2LAFW = (0x1D50, 0x608C)
+CYPRESS = (0x04B4, 0x8613)
+KNOWN = (EEPROM_ID, FX2LAFW, CYPRESS)
+
+
+class Device:
+    def __init__(self, dev):
+        self.ids = (dev.getVendorID(), dev.getProductID())
+        self.location = (dev.getBusNumber(), dev.getDeviceAddress())
+        desc = dev.device_descriptor
+        self.has_strings = bool(desc.iManufacturer or desc.iProduct)
+        self.manufacturer = self.product = None
+        self.strings_error = None
+        if self.has_strings:
+            try:
+                self.manufacturer = dev.getManufacturer()
+                self.product = dev.getProduct()
+            except usb1.USBError as e:
+                self.strings_error = e
+
+
+def find_device():
+    with usb1.USBContext() as ctx:
+        for dev in ctx.getDeviceIterator(skip_on_error=True):
+            if (dev.getVendorID(), dev.getProductID()) in KNOWN:
+                return Device(dev)
+    return None
+
+
+def classify(dev):
+    if dev is None:
+        return "absent"
+    if dev.ids == FX2LAFW:
+        return "fx2lafw"
+    if dev.ids == CYPRESS:
+        return "cypress"
+    if not dev.has_strings:
+        return "bare"
+    if dev.strings_error:
+        return "unreadable"
+    if dev.product == "fx2lafw" or dev.manufacturer == "sigrok":
+        return "fx2lafw"
+    return "other"
+
+
+def describe(dev):
+    if dev is None:
+        return "no FX2 device found"
+    ids = f"{dev.ids[0]:04x}:{dev.ids[1]:04x}"
+    if not dev.has_strings:
+        return f"{ids} (no strings)"
+    if dev.strings_error:
+        return f"{ids} (has strings, can't read them: {dev.strings_error})"
+    return f"{ids} {dev.manufacturer} {dev.product}"
+
+
+def wait_for_reenumeration(old_location, timeout=8.0):
+    """Wait until the device shows up again with a new bus address."""
+    deadline = time.monotonic() + timeout
+    saw_detach = False
+    while time.monotonic() < deadline:
+        dev = find_device()
+        if dev is None:
+            saw_detach = True
+        elif saw_detach or dev.location != old_location:
+            time.sleep(0.5)  # let the OS finish setting it up
+            return find_device(), True
+        time.sleep(0.1)
+    return find_device(), saw_detach
+
+
+def main():
+    force = "--force" in sys.argv[1:]
+    dev = find_device()
+    state = classify(dev)
+    print(f"current: {describe(dev)}")
+
+    if state == "absent":
+        print("error: plug in the logic analyzer (with its inputs disconnected)",
+              file=sys.stderr)
+        return 2
+    if state == "cypress":
+        print("device is at Cypress defaults (04b4:8613); the EEPROM ID is not "
+              "being used. Replug the device to boot from EEPROM.", file=sys.stderr)
+        return 3
+    if not force:
+        if state == "bare":
+            print("already in EEPROM-boot state, nothing to do (--force to reload anyway)")
+            return 0
+        if state == "other":
+            print("running some other firmware (probably the vendor app's), "
+                  "nothing to do (--force to reset anyway)")
+            return 0
+        if state == "unreadable":
+            print("can't tell which firmware is running (no permission to read "
+                  "strings?); use --force to reset anyway", file=sys.stderr)
+            return 2
+
+    if not os.path.exists(FIRMWARE):
+        print(f"error: {FIRMWARE} missing, run 'make' first", file=sys.stderr)
+        return 2
+
+    print("loading reenum firmware...")
+    rc = subprocess.run(
+        [FX2TOOL, "-d", f"{dev.ids[0]:04x}:{dev.ids[1]:04x}", "load", FIRMWARE]).returncode
+    if rc != 0:
+        print(f"error: fx2tool exited with {rc}", file=sys.stderr)
+        return rc
+
+    dev, reenumerated = wait_for_reenumeration(dev.location)
+    state = classify(dev)
+    print(f"final:   {describe(dev)}")
+
+    if state == "bare":
+        print("OK: device is back in EEPROM-boot state; vendor app should detect it")
+        return 0
+    if state == "cypress":
+        print("FAILED: the FX2 core re-enumerated with Cypress defaults (04b4:8613), "
+              "so it did not keep the EEPROM VID/PID.\n"
+              "Replug the device.", file=sys.stderr)
+        return 3
+    if state == "absent":
+        print("FAILED: device did not come back", file=sys.stderr)
+        return 4
+    if not reenumerated:
+        print("FAILED: device never re-enumerated (old firmware may still be running)",
+              file=sys.stderr)
+    else:
+        print("FAILED: device re-enumerated but still reports firmware strings",
+              file=sys.stderr)
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())
