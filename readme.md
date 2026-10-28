@@ -1,4 +1,4 @@
-# FX2 logic analyzer clone reset tool
+# FX2 logic analyzer reset tool
 
 A tool to reset cheap 8-channel logic analyzer clones (Cypress FX2, CY7C68013A) after another tool (like sigrok/PulseView) loads its own firmware and the vendor app can't connect anymore. No unplug needed.
 
